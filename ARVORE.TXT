@@ -1,0 +1,24 @@
+
+PLATINA-EXTINTORES/
+├── README.md
+├── .gitignore
+├── requirements.txt
+├── .env.example
+├── docs/
+│   └── arquitetura-inicial.md
+├── frontend/
+│   ├── index.html
+│   ├── css/
+│   │   └── style.css
+│   └── js/
+│       └── main.js
+├── backend/
+│   ├── app.py
+│   └── routes/
+│       └── __init__.py
+├── tests/
+│   └── test_app.py
+├── notebooks/
+│   └── README.md
+└── .vscode/
+    └── extensions.json
