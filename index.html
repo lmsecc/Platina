@@ -1,0 +1,359 @@
+"""
+Platina Extintores - Chatbot por setores (arquivo único)
+
+Como rodar:
+    pip install flask
+    python appy.py
+Depois abra http://localhost:5000
+
+O arquivo tem 6 partes, nesta ordem:
+  1. DADOS         -> preços e estoque de exemplo (troque pelos reais)
+  2. SETOR QUALIDADE
+  3. SETOR ESTOQUE
+  4. SETOR FINANCEIRO
+  5. CHATBOT       -> escolhe o setor e devolve a resposta
+  6. SITE E API    -> tela do chat e rotas
+"""
+import datetime
+import json
+import os
+import re
+import unicodedata
+from flask import Flask, jsonify, request
+
+# =====================================================================
+# 1. DADOS (exemplos - troque pelos valores reais da empresa)
+# =====================================================================
+PRODUTOS = [
+    {"nome": "Extintor PQS ABC 4 kg", "chaves": ["pqs", "4kg"], "estoque": 35, "minimo": 20, "preco": 129.90},
+    {"nome": "Extintor PQS ABC 6 kg", "chaves": ["pqs", "6kg"], "estoque": 12, "minimo": 15, "preco": 169.90},
+    {"nome": "Extintor CO2 6 kg", "chaves": ["co2", "6kg"], "estoque": 8, "minimo": 10, "preco": 489.00},
+    {"nome": "Extintor Água 10 L", "chaves": ["agua", "10l"], "estoque": 22, "minimo": 10, "preco": 139.90},
+    {"nome": "Extintor Espuma 9 L", "chaves": ["espuma", "9l"], "estoque": 4, "minimo": 8, "preco": 219.90},
+]
+
+SERVICOS = {"Recarga": 59.90, "Teste hidrostático": 89.90, "Manutenção": 45.00}
+
+
+DESCRICOES = {
+    "pqs": "Pó químico para fogo em madeira, líquidos inflamáveis e equipamentos elétricos (classes A, B e C).",
+    "co2": "Gás carbônico, não deixa resíduo. Para líquidos inflamáveis e equipamentos elétricos (classes B e C).",
+    "agua": "Para fogo em madeira, papel e tecido (classe A). Não use em equipamentos elétricos.",
+    "espuma": "Para fogo em madeira, papel e líquidos inflamáveis (classes A e B).",
+    "Recarga": "Recarga do extintor com etiqueta e selo atualizados.",
+    "Teste hidrostático": "Teste de resistência do cilindro, necessário a cada 5 anos.",
+    "Manutenção": "Revisão de manômetro, válvula, mangueira e lacre.",
+}
+
+
+def reais(valor):
+    """Escreve o valor no formato brasileiro: R$ 1.234,50"""
+    texto = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {texto}"
+
+
+def normalizar_medidas(texto):
+    """Troca '6 kg' por '6kg' e 'litros' por 'l' para facilitar a busca."""
+    texto = texto.replace("litros", "l").replace("litro", "l")
+    return re.sub(r"(\d)\s+(kg|l)\b", r"\1\2", texto)
+
+
+def achar_produto(texto):
+    texto = normalizar_medidas(texto)
+    for p in PRODUTOS:
+        if all(chave in texto for chave in p["chaves"]):
+            return p
+    return None
+
+
+# =====================================================================
+# 2. SETOR QUALIDADE - prazos, selo, norma e inspeção
+# =====================================================================
+def qualidade(texto):
+    if "hidrostatico" in texto:
+        return ("O teste hidrostático verifica se o cilindro aguenta a pressão sem vazar ou deformar.\n"
+                "Ele deve ser feito a cada 5 anos. Se o cilindro reprovar, ele precisa ser trocado.")
+    if "selo" in texto or "inmetro" in texto:
+        return ("O selo do Inmetro mostra que o extintor foi fabricado ou recarregado dentro das regras.\n"
+                "Confira se o selo está inteiro, legível e dentro do prazo. Sem selo, o extintor não vale.")
+    if any(p in texto for p in ["recarga", "prazo", "validade", "vencido", "vence"]):
+        return ("Prazos principais:\n"
+                "- Inspeção: todo mês, olhando lacre, manômetro e mangueira.\n"
+                "- Recarga: a cada 12 meses (ou logo após qualquer uso).\n"
+                "- Teste hidrostático: a cada 5 anos.\n"
+                "A data de validade fica na etiqueta presa ao extintor.")
+    if any(p in texto for p in ["inspecao", "inspecionar", "manometro", "lacre", "bom", "defeito"]):
+        return ("Faça esta checagem rápida todo mês:\n"
+                "1. O ponteiro do manômetro está na faixa verde?\n"
+                "2. O lacre está intacto?\n"
+                "3. A mangueira e o bico estão sem rachaduras ou entupimento?\n"
+                "4. O cilindro está sem ferrugem ou amassados?\n"
+                "5. O selo e a etiqueta estão dentro do prazo?\n"
+                "Se alguma resposta for não, chame a manutenção.")
+    if any(p in texto for p in ["norma", "abnt", "certificado", "laudo"]):
+        return ("A norma que orienta inspeção, manutenção e recarga de extintores é a ABNT NBR 12962.\n"
+                "Depois do serviço, a empresa deve entregar a etiqueta e o selo atualizados.")
+    return ("Posso ajudar com: prazo de recarga, teste hidrostático, selo do Inmetro, "
+            "inspeção mensal e normas. Qual desses você quer saber?")
+
+
+# =====================================================================
+# 3. SETOR ESTOQUE - quantidades e itens acabando
+# =====================================================================
+def _situacao(p):
+    return "BAIXO - repor" if p["estoque"] < p["minimo"] else "ok"
+
+
+def _linha_estoque(p):
+    return f"- {p['nome']}: {p['estoque']} un. (mínimo {p['minimo']}) - {_situacao(p)}"
+
+
+def estoque(texto):
+    produto = achar_produto(texto)
+    if produto:
+        return (f"{produto['nome']}\nEm estoque: {produto['estoque']} un.\n"
+                f"Estoque mínimo: {produto['minimo']} un.\nSituação: {_situacao(produto)}")
+
+    if any(p in texto for p in ["acabando", "baixo", "reposicao", "repor", "falta"]):
+        baixos = [p for p in PRODUTOS if p["estoque"] < p["minimo"]]
+        if not baixos:
+            return "Nenhum item está abaixo do estoque mínimo. Tudo certo!"
+        return "Itens abaixo do mínimo (precisam de reposição):\n" + "\n".join(_linha_estoque(p) for p in baixos)
+
+    if any(p in texto for p in ["todo", "todos", "lista", "estoque", "tudo"]):
+        return "Estoque atual:\n" + "\n".join(_linha_estoque(p) for p in PRODUTOS)
+
+    return ("Me diga o extintor que você quer consultar (ex.: 'PQS 6 kg' ou 'CO2 6 kg'), "
+            "ou peça 'ver todo o estoque' ou 'o que está acabando'.")
+
+
+# =====================================================================
+# 4. SETOR FINANCEIRO - preços, orçamento, pagamento e nota fiscal
+# =====================================================================
+def financeiro(texto):
+    texto = normalizar_medidas(texto)
+    produto = achar_produto(texto)
+
+    if produto:
+        numeros = re.findall(r"(?<![\w])\d+(?![\w])", texto)  # número solto = quantidade
+        qtd = int(numeros[0]) if numeros else None
+        if qtd or "orcamento" in texto:
+            qtd = qtd or 1
+            return (f"Orçamento:\n{qtd} x {produto['nome']} a {reais(produto['preco'])}\n"
+                    f"Total: {reais(qtd * produto['preco'])}\n"
+                    "Valores de exemplo. Peça confirmação ao financeiro.")
+        return f"{produto['nome']}: {reais(produto['preco'])} por unidade."
+
+    if "orcamento" in texto:
+        return "Para fazer o orçamento, diga o extintor e a quantidade. Exemplo: 'orçamento de 5 PQS 6 kg'."
+
+    if any(p in texto for p in ["pagamento", "pagar", "boleto", "pix", "cartao", "parcela"]):
+        return ("Formas de pagamento:\n"
+                "- Pix: 5% de desconto à vista.\n"
+                "- Cartão de crédito: em até 3x sem juros.\n"
+                "- Boleto: 28 dias, para clientes com cadastro aprovado.")
+
+    if "nota" in texto or "fiscal" in texto:
+        return ("A nota fiscal é emitida no mesmo dia da entrega ou do serviço e enviada por e-mail.\n"
+                "Se não recebeu, peça a segunda via ao financeiro informando o CNPJ.")
+
+    if any(p in texto for p in ["preco", "valor", "tabela", "custa", "quanto"]):
+        itens = [f"- {p['nome']}: {reais(p['preco'])}" for p in PRODUTOS]
+        servicos = [f"- {nome}: {reais(v)}" for nome, v in SERVICOS.items()]
+        return "Tabela de preços:\n" + "\n".join(itens) + "\n\nServiços:\n" + "\n".join(servicos)
+
+    return "Posso ajudar com preços, orçamento, formas de pagamento e nota fiscal. O que você precisa?"
+
+
+# =====================================================================
+# 5. CHATBOT - escolhe o setor e devolve a resposta
+# =====================================================================
+SETORES = {
+    "qualidade": {
+        "nome": "Qualidade",
+        "descricao": "Prazos, selos, normas e inspeção",
+        "boas_vindas": "Setor de Qualidade. Posso explicar prazos de recarga, teste hidrostático, selo do Inmetro e como inspecionar um extintor.",
+        "sugestoes": ["Qual o prazo de recarga?", "O que é teste hidrostático?", "Como ver se o extintor está bom?"],
+        "palavras": ["qualidade", "inspecao", "inspecionar", "selo", "inmetro", "norma", "abnt", "validade",
+                     "vencido", "vence", "prazo", "recarga", "hidrostatico", "manometro", "lacre",
+                     "defeito", "certificado", "laudo"],
+        "responder": qualidade,
+    },
+    "estoque": {
+        "nome": "Estoque",
+        "descricao": "Quantidades e itens acabando",
+        "boas_vindas": "Setor de Estoque. Posso dizer quantas unidades temos de cada extintor e quais itens estão acabando.",
+        "sugestoes": ["Ver todo o estoque", "O que está acabando?", "Quantos PQS 6 kg temos?"],
+        "palavras": ["estoque", "quantos", "quantas", "unidades", "disponivel", "temos", "acabando",
+                     "baixo", "reposicao", "repor", "saldo", "falta"],
+        "responder": estoque,
+    },
+    "financeiro": {
+        "nome": "Financeiro",
+        "descricao": "Preços, orçamento e pagamento",
+        "boas_vindas": "Setor Financeiro. Posso informar preços, fazer um orçamento simples e explicar formas de pagamento e nota fiscal.",
+        "sugestoes": ["Tabela de preços", "Orçamento de 5 PQS 6 kg", "Formas de pagamento"],
+        "palavras": ["financeiro", "preco", "valor", "custa", "quanto", "orcamento", "pagamento", "pagar",
+                     "boleto", "pix", "cartao", "parcela", "nota", "fiscal", "desconto", "fatura", "cobranca"],
+        "responder": financeiro,
+    },
+}
+
+SAUDACAO = ("Olá! Eu sou o assistente da Platina Extintores. "
+            "Escolha um setor ao lado ou escreva sua pergunta que eu encaminho.")
+
+
+def limpar(texto):
+    """Deixa tudo em minúsculo e sem acento para facilitar a busca."""
+    sem_acento = "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+    return sem_acento.lower().strip()
+
+
+def descobrir_setor(texto):
+    pontos = {id_: sum(p in texto for p in s["palavras"]) for id_, s in SETORES.items()}
+    melhor = max(pontos, key=pontos.get)
+    return melhor if pontos[melhor] > 0 else None
+
+
+def responder(mensagem, setor=None):
+    texto = limpar(mensagem or "")
+    if not texto:
+        return {"setor": setor, "resposta": "Escreva sua pergunta para eu poder ajudar."}
+    if texto in ("oi", "ola", "bom dia", "boa tarde", "boa noite"):
+        return {"setor": setor, "resposta": SAUDACAO}
+
+    # Se a frase é claramente de outro setor, troca. Senão, mantém o escolhido.
+    escolhido = descobrir_setor(texto) or (setor if setor in SETORES else None)
+    if escolhido is None:
+        return {"setor": None, "resposta": "Não entendi bem. Sua dúvida é sobre Qualidade, Estoque ou Financeiro?"}
+    return {"setor": escolhido, "resposta": SETORES[escolhido]["responder"](texto)}
+
+
+# =====================================================================
+# 6. SITE, CATÁLOGO, PEDIDOS E AGENDAMENTOS
+# =====================================================================
+RAIZ = os.path.dirname(os.path.abspath(__file__))
+PASTA_REGISTROS = os.path.join(RAIZ, "registros")
+
+app = Flask(__name__, static_folder=os.path.join(RAIZ, "site"), static_url_path="")
+
+
+def catalogo():
+    """Lista única de produtos e serviços que o site mostra."""
+    itens = []
+    for i, p in enumerate(PRODUTOS, 1):
+        itens.append({"id": f"p{i}", "nome": p["nome"], "categoria": "extintores", "emoji": "🧯",
+                      "preco": p["preco"], "descricao": DESCRICOES[p["chaves"][0]],
+                      "estoque_baixo": p["estoque"] < p["minimo"]})
+    for i, (nome, preco) in enumerate(SERVICOS.items(), 1):
+        itens.append({"id": f"s{i}", "nome": nome, "categoria": "servicos", "emoji": "🔧",
+                      "preco": preco, "descricao": DESCRICOES[nome], "estoque_baixo": False})
+    return itens
+
+
+def salvar(arquivo, registro):
+    """Guarda uma linha em registros/<arquivo>.jsonl"""
+    os.makedirs(PASTA_REGISTROS, exist_ok=True)
+    registro["registrado_em"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(os.path.join(PASTA_REGISTROS, arquivo + ".jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+
+
+def erro(texto):
+    return jsonify({"ok": False, "erro": texto}), 400
+
+
+def so_digitos(texto):
+    return re.sub(r"\D", "", str(texto or ""))
+
+
+@app.get("/")
+def inicio():
+    return app.send_static_file("index.html")
+
+
+@app.get("/api/setores")
+def api_setores():
+    return jsonify([{"id": id_, "nome": s["nome"], "descricao": s["descricao"],
+                     "boas_vindas": s["boas_vindas"], "sugestoes": s["sugestoes"]}
+                    for id_, s in SETORES.items()])
+
+
+@app.get("/api/produtos")
+def api_produtos():
+    return jsonify(catalogo())
+
+
+@app.post("/api/chat")
+def api_chat():
+    dados = request.get_json(silent=True) or {}
+    return jsonify(responder(dados.get("mensagem", ""), dados.get("setor")))
+
+
+@app.post("/api/pedido")
+def api_pedido():
+    d = request.get_json(silent=True) or {}
+    por_id = {i["id"]: i for i in catalogo()}
+    itens, total = [], 0.0
+    for it in d.get("itens", []):
+        item = por_id.get(it.get("id"))
+        try:
+            qtd = int(it.get("qtd", 0))
+        except (TypeError, ValueError):
+            qtd = 0
+        if item and 0 < qtd <= 999:   # o preço vem do servidor, nunca do navegador
+            itens.append({"nome": item["nome"], "qtd": qtd, "preco": item["preco"]})
+            total += qtd * item["preco"]
+    nome = str(d.get("nome", "")).strip()[:100]
+    telefone = so_digitos(d.get("telefone"))
+    empresa = bool(d.get("empresa"))
+    cnpj = str(d.get("cnpj", "")).strip()[:200]
+
+    if not itens:
+        return erro("Seu pedido está vazio.")
+    if len(nome) < 2:
+        return erro("Informe seu nome.")
+    if len(telefone) not in (10, 11):
+        return erro("Informe o telefone com DDD.")
+    if empresa and not cnpj:
+        return erro("Informe o CNPJ e a razão social.")
+
+    salvar("pedidos", {"nome": nome, "telefone": telefone, "empresa": empresa, "cnpj": cnpj if empresa else "",
+                       "itens": itens, "total": round(total, 2)})
+    return jsonify({"ok": True, "total": total,
+                    "mensagem": f"Pedido recebido! Total {reais(total)}. Nossa equipe vai entrar em contato para confirmar."})
+
+
+@app.post("/api/agendamento")
+def api_agendamento():
+    d = request.get_json(silent=True) or {}
+    nome = str(d.get("nome", "")).strip()[:100]
+    telefone = so_digitos(d.get("telefone"))
+    local = str(d.get("local", "")).strip()[:200]
+    servicos = [s for s in d.get("servicos", []) if s in SERVICOS]
+    try:
+        data = datetime.date.fromisoformat(str(d.get("data", "")))
+        qtd = int(d.get("qtd", 0))
+    except (TypeError, ValueError):
+        return erro("Confira a data e a quantidade.")
+
+    if len(nome) < 2:
+        return erro("Informe seu nome.")
+    if len(telefone) not in (10, 11):
+        return erro("Informe o telefone com DDD.")
+    if data < datetime.date.today():
+        return erro("A data não pode ser no passado.")
+    if not 0 < qtd <= 9999:
+        return erro("Informe a quantidade de extintores.")
+    if len(local) < 3:
+        return erro("Informe a empresa ou o endereço.")
+    if not servicos:
+        return erro("Escolha pelo menos um serviço.")
+
+    salvar("agendamentos", {"nome": nome, "telefone": telefone, "data": data.isoformat(),
+                            "qtd": qtd, "local": local, "servicos": servicos})
+    return jsonify({"ok": True, "mensagem": f"Serviço agendado para {data.strftime('%d/%m/%Y')}. Vamos confirmar pelo telefone."})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
